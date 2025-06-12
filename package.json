@@ -1,9 +1,10 @@
 {
   "name": "mobile-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Backend for Decentral Docs with Pinata IPFS integration.",
+  "main": "server.js",
   "scripts": {
+    "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -19,6 +20,7 @@
   },
   "homepage": "https://github.com/Goutham-bhat/mobile-backend-decentraldocs#readme",
   "dependencies": {
+    "@pinata/sdk": "^2.1.0",
     "axios": "^1.9.0",
     "cors": "^2.8.5",
     "dotenv": "^16.5.0",
