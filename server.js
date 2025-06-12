@@ -6,42 +6,138 @@ const cors = require('cors');
 const fs = require('fs');
 const fsp = require('fs/promises');
 const https = require('https');
-const path = require('path');
+const mongoose = require('mongoose');
 const PinataClient = require('@pinata/sdk');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Load env variables
 const pinataApiKey = process.env.PINATA_API_KEY;
 const pinataSecretApiKey = process.env.PINATA_SECRET_API_KEY;
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+const mongoUri = process.env.MONGODB_URI;
 
 if (!pinataApiKey || !pinataSecretApiKey) {
     console.error("❌ Pinata API keys missing! Please set PINATA_API_KEY and PINATA_SECRET_API_KEY in your .env file.");
     process.exit(1);
 }
 
+if (!mongoUri) {
+    console.error("❌ MongoDB URI missing! Please set MONGODB_URI in your .env file.");
+    process.exit(1);
+}
+
+// Connect to MongoDB Atlas
+mongoose.connect(mongoUri, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+}).then(() => console.log('✅ Connected to MongoDB Atlas'))
+  .catch(err => {
+    console.error('❌ MongoDB connection error:', err);
+    process.exit(1);
+});
+
+// Define User schema/model
+const userSchema = new mongoose.Schema({
+    username: { type: String, unique: true },
+    password: String,
+});
+const User = mongoose.model('User', userSchema);
+
+// Define File schema/model
+const fileSchema = new mongoose.Schema({
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    ipfsHash: String,
+    filename: String,
+    uploadedAt: { type: Date, default: Date.now },
+});
+const File = mongoose.model('File', fileSchema);
+
+// Initialize Pinata client
 const pinata = new PinataClient({
-    pinataApiKey: pinataApiKey,
-    pinataSecretApiKey: pinataSecretApiKey
+    pinataApiKey,
+    pinataSecretApiKey
 });
 
-pinata.testAuthentication().then((result) => {
-    console.log("Pinata connection test result:", result);
-}).catch((err) => {
-    console.error("Pinata connection test failed:", err);
-});
+pinata.testAuthentication()
+    .then(() => console.log('✅ Pinata authentication successful'))
+    .catch(err => {
+        console.error('❌ Pinata authentication failed:', err);
+        process.exit(1);
+    });
 
-app.use(cors());
+// Middleware
+app.use(cors()); // backend-only; no origin restrictions needed
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 const upload = multer({ dest: '/tmp/' });
 
+// JWT Auth Middleware
+function authenticateToken(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader?.split(' ')[1];
+
+    if (!token) return res.status(401).json({ error: 'Missing token' });
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).json({ error: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+}
+
+// Routes
 app.get('/', (req, res) => {
-    res.send('Decentral Docs Backend (Pinata IPFS Only) is running!');
+    res.send('✅ Decentral Docs Backend is running (Pinata IPFS only)');
 });
 
-app.post('/upload', upload.single('file'), async (req, res) => {
+// Register
+app.post('/auth/register', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password required' });
+    }
+
+    try {
+        if (await User.findOne({ username })) {
+            return res.status(409).json({ error: 'User already exists' });
+        }
+        const hashedPassword = await bcrypt.hash(password, 10);
+        const newUser = new User({ username, password: hashedPassword });
+        await newUser.save();
+        res.status(201).json({ message: 'User registered successfully' });
+    } catch (err) {
+        console.error('Register error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Login
+app.post('/auth/login', async (req, res) => {
+    const { username, password } = req.body;
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password required' });
+    }
+
+    try {
+        const user = await User.findOne({ username });
+        if (!user || !(await bcrypt.compare(password, user.password))) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        const token = jwt.sign({ userId: user._id, username }, JWT_SECRET, { expiresIn: '1h' });
+        res.json({ token });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Upload
+app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
     if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded.' });
     }
@@ -55,9 +151,13 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     };
 
     try {
-        console.log(`Attempting to pin ${req.file.originalname} to Pinata...`);
         const result = await pinata.pinFileToIPFS(readableStreamForFile, options);
-        console.log("Pinata upload successful:", result.IpfsHash);
+        const newFile = new File({
+            userId: req.user.userId,
+            ipfsHash: result.IpfsHash,
+            filename: req.file.originalname,
+        });
+        await newFile.save();
 
         await fsp.unlink(filePath);
 
@@ -68,76 +168,81 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             Timestamp: result.Timestamp,
             isDuplicate: result.isDuplicate || false,
         });
-
     } catch (error) {
-        console.error("Error uploading file to Pinata:", error);
+        console.error("Pinata upload error:", error);
         if (req.file?.path) {
             try {
                 await fsp.unlink(filePath);
             } catch (cleanupErr) {
-                console.error("Error cleaning up temporary file after failed upload:", cleanupErr);
+                console.error("Cleanup error:", cleanupErr);
             }
         }
-        res.status(500).json({ error: 'Failed to upload file to Pinata.', details: error.message });
+        res.status(500).json({ error: 'Failed to upload file to Pinata.' });
     }
 });
 
-app.get('/files', async (req, res) => {
+// List files
+app.get('/files', authenticateToken, async (req, res) => {
     try {
-        const result = await pinata.pinList({ status: 'pinned', pageLimit: 10 });
-        res.json({ files: result.rows });
+        const userFiles = await File.find({ userId: req.user.userId }).select('-__v');
+        res.json({ files: userFiles });
     } catch (err) {
-        console.error('Error listing files:', err);
-        res.status(500).json({ error: err.message || 'Failed to retrieve file list from Pinata.' });
+        console.error('Fetch files error:', err);
+        res.status(500).json({ error: 'Failed to retrieve files' });
     }
 });
 
-app.delete('/unpin/:hash', async (req, res) => {
+// Unpin
+app.delete('/unpin/:hash', authenticateToken, async (req, res) => {
+    const ipfsHash = req.params.hash;
+
     try {
-        const ipfsHash = req.params.hash;
-        console.log(`Attempting to unpin file with hash: ${ipfsHash}`);
+        const file = await File.findOneAndDelete({ userId: req.user.userId, ipfsHash });
+        if (!file) return res.status(404).json({ error: 'File not found' });
+
         await pinata.unpin(ipfsHash);
-        console.log(`File with hash ${ipfsHash} unpinned successfully.`);
-        res.json({ success: true, message: `File with hash ${ipfsHash} unpinned.` });
+        res.json({ success: true, message: `File with hash ${ipfsHash} unpinned and deleted.` });
     } catch (err) {
-        console.error('Error unpinning file:', err);
-        res.status(500).json({ error: err.message || `Failed to unpin file with hash ${req.params.hash}.` });
+        console.error('Unpin error:', err);
+        res.status(500).json({ error: 'Failed to unpin file' });
     }
 });
 
-app.get('/download/:hash', async (req, res) => {
+// Download
+app.get('/download/:hash', authenticateToken, async (req, res) => {
     const hash = req.params.hash;
     const fileUrl = `https://gateway.pinata.cloud/ipfs/${hash}`;
 
     try {
-        const { rows } = await pinata.pinList({ hashContains: hash, status: 'pinned', pageLimit: 1 });
-        const originalName = rows[0]?.metadata?.name || hash;
+        const file = await File.findOne({ userId: req.user.userId, ipfsHash: hash });
+        const originalName = file?.filename || hash;
 
-        console.log(`Attempting to download file from IPFS: ${fileUrl}`);
         https.get(fileUrl, fileRes => {
             if (fileRes.statusCode !== 200) {
-                console.error(`Gateway responded with status: ${fileRes.statusCode}`);
-                return res.status(fileRes.statusCode).json({ error: `Failed to retrieve file from IPFS gateway (Status: ${fileRes.statusCode})` });
+                return res.status(fileRes.statusCode).json({ error: `Failed to retrieve file (Status: ${fileRes.statusCode})` });
             }
             res.setHeader('Content-Disposition', `attachment; filename="${originalName}"`);
             fileRes.pipe(res);
         }).on('error', err => {
-                console.error('Error during file download stream:', err);
-                res.status(500).json({ error: 'Failed to download file from IPFS gateway due to stream error.' });
-            });
+            console.error('Download error:', err);
+            res.status(500).json({ error: 'Failed to download file.' });
+        });
     } catch (err) {
-        console.error('Error fetching file metadata or initiating download:', err);
-        res.status(500).json({ error: err.message || 'Failed to prepare file download.' });
+        console.error('Preparation error:', err);
+        res.status(500).json({ error: 'Failed to prepare download.' });
     }
 });
 
+// Start server
 app.listen(port, () => {
-    console.log(`Server is running on http://localhost:${port}`);
+    console.log(`🚀 Server live on port ${port}`);
     console.log(`Pinata status: ${pinataApiKey ? '✅ Ready' : '❌ Not configured'}`);
-    console.log('--- Endpoints Ready ---');
-    console.log(`GET /         : Health Check`);
-    console.log(`POST /upload  : Upload a file to Pinata IPFS`);
-    console.log(`GET /files    : List pinned files from Pinata`);
-    console.log(`DELETE /unpin/:hash: Unpin a file from Pinata`);
-    console.log(`GET /download/:hash: Download a file from IPFS via gateway`);
+    console.log(`Available endpoints:
+    - GET    /                (Health check)
+    - POST   /auth/register   (Register)
+    - POST   /auth/login      (Login)
+    - POST   /upload          (Upload file)
+    - GET    /files           (List files)
+    - GET    /download/:hash  (Download file)
+    - DELETE /unpin/:hash     (Unpin file)`);
 });
