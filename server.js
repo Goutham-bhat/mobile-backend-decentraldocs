@@ -4,22 +4,27 @@ const multer = require('multer');
 const cors = require('cors');
 const fs = require('fs');
 const fsp = require('fs/promises');
-const https = require('https');
 const mongoose = require('mongoose');
 const PinataClient = require('@pinata/sdk');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Enhanced environment validation
+// ======================
+// Environment Validation
+// ======================
 const requiredEnvVars = [
   'PINATA_API_KEY',
   'PINATA_SECRET_API_KEY',
   'JWT_SECRET',
-  'MONGODB_URI'
+  'REFRESH_TOKEN_SECRET',
+  'MONGODB_URI',
+  'ACCESS_TOKEN_EXPIRES_IN',
+  'REFRESH_TOKEN_EXPIRES_IN'
 ];
 
 const missingVars = requiredEnvVars.filter(v => !process.env[v]);
@@ -28,7 +33,9 @@ if (missingVars.length > 0) {
   process.exit(1);
 }
 
-// Database connection with improved settings
+// ======================
+// Database Configuration
+// ======================
 mongoose.connect(process.env.MONGODB_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
@@ -41,28 +48,53 @@ mongoose.connect(process.env.MONGODB_URI, {
   process.exit(1);
 });
 
-// Enhanced rate limiting
+// =================
+// Rate Limiting
+// =================
 const apiLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 100,
-  standardHeaders: true,
-  legacyHeaders: false,
+  message: 'Too many requests, please try again later'
 });
 
-// Models with validation and indexes
+// ================
+// Pinata Setup
+// ================
+const pinata = new PinataClient({
+  pinataApiKey: process.env.PINATA_API_KEY,
+  pinataSecretApiKey: process.env.PINATA_SECRET_API_KEY,
+  timeout: 30000
+});
+
+// Verify Pinata connection
+pinata.testAuthentication()
+  .then(() => console.log('✅ Pinata authentication successful'))
+  .catch(err => {
+    console.error('❌ Pinata authentication failed:', err);
+    process.exit(1);
+  });
+
+// ================
+// Mongoose Models
+// ================
 const userSchema = new mongoose.Schema({
   username: { 
     type: String, 
     unique: true,
     required: true,
     minlength: 3,
-    maxlength: 30
+    maxlength: 30,
+    trim: true
   },
   password: {
     type: String,
     required: true,
     minlength: 8
   },
+  tokenVersion: {
+    type: Number,
+    default: 0
+  }
 }, { timestamps: true });
 
 const fileSchema = new mongoose.Schema({
@@ -84,63 +116,74 @@ const fileSchema = new mongoose.Schema({
     type: Number,
     required: true
   },
-  mimetype: String
+  mimetype: String,
+  pinStatus: {
+    type: String,
+    enum: ['pinned', 'unpinned'],
+    default: 'pinned'
+  }
 }, { timestamps: true });
 
-// Add indexes for better query performance
+// Add indexes
+userSchema.index({ username: 1 });
 fileSchema.index({ userId: 1 });
 fileSchema.index({ ipfsHash: 1 });
 
 const User = mongoose.model('User', userSchema);
 const File = mongoose.model('File', fileSchema);
 
-// Initialize Pinata with timeout
-const pinata = new PinataClient({
-  pinataApiKey: process.env.PINATA_API_KEY,
-  pinataSecretApiKey: process.env.PINATA_SECRET_API_KEY,
-  timeout: 30000 // 30 seconds timeout
-});
-
-// Enhanced authentication test
-async function verifyPinataConnection() {
-  try {
-    await pinata.testAuthentication();
-    console.log('✅ Pinata authentication successful');
-  } catch (err) {
-    console.error('❌ Pinata authentication failed:', err.message);
-    process.exit(1);
-  }
-}
-verifyPinataConnection();
-
-// Middleware stack
+// =================
+// Middleware Stack
+// =================
+app.use(helmet());
 app.use(cors({
   origin: process.env.CORS_ORIGINS?.split(',') || '*',
   methods: ['GET', 'POST', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  credentials: true
 }));
-
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(apiLimiter);
+app.use('/auth', apiLimiter);
 
-// Configure multer with file size limits
+// =================
+// File Upload Setup
+// =================
 const upload = multer({
   dest: '/tmp/',
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 10 * 1024 * 1024,
     files: 1
   },
   fileFilter: (req, file, cb) => {
-    if (!file.originalname.match(/\.(jpg|jpeg|png|gif|pdf|docx|txt)$/i)) {
-      return cb(new Error('Only certain file types are allowed!'), false);
+    const allowedTypes = /\.(jpg|jpeg|png|gif|pdf|docx|txt)$/i;
+    if (!file.originalname.match(allowedTypes)) {
+      return cb(new Error('Only image, PDF, and text files are allowed'), false);
     }
     cb(null, true);
   }
 });
 
-// Enhanced JWT middleware
-function authenticateToken(req, res, next) {
+// ======================
+// Authentication Helpers
+// ======================
+const generateAccessToken = (user) => {
+  return jwt.sign(
+    { userId: user._id, username: user.username },
+    process.env.JWT_SECRET,
+    { expiresIn: process.env.ACCESS_TOKEN_EXPIRES_IN || '15m' }
+  );
+};
+
+const generateRefreshToken = (user) => {
+  return jwt.sign(
+    { userId: user._id, tokenVersion: user.tokenVersion },
+    process.env.REFRESH_TOKEN_SECRET,
+    { expiresIn: process.env.REFRESH_TOKEN_EXPIRES_IN || '7d' }
+  );
+};
+
+const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
   const token = authHeader?.split(' ')[1];
 
@@ -150,7 +193,10 @@ function authenticateToken(req, res, next) {
     if (err) {
       const message = err.name === 'TokenExpiredError' ? 
         'Token expired' : 'Invalid token';
-      return res.status(403).json({ error: message });
+      return res.status(403).json({ 
+        error: message,
+        code: err.name === 'TokenExpiredError' ? 'TOKEN_EXPIRED' : 'INVALID_TOKEN'
+      });
     }
     
     req.user = {
@@ -159,9 +205,13 @@ function authenticateToken(req, res, next) {
     };
     next();
   });
-}
+};
 
-// Health check endpoint
+// =============
+// API Endpoints
+// =============
+
+// Health Check
 app.get('/', (req, res) => {
   res.json({ 
     status: 'healthy',
@@ -173,7 +223,7 @@ app.get('/', (req, res) => {
   });
 });
 
-// Enhanced auth routes
+// Auth Routes
 app.post('/auth/register', async (req, res) => {
   try {
     const { username, password } = req.body;
@@ -219,16 +269,15 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
 
-    const token = jwt.sign(
-      { userId: user._id, username: user.username },
-      process.env.JWT_SECRET,
-      { expiresIn: '1h' }
-    );
+    const accessToken = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user);
 
     res.json({ 
-      token,
-      expiresIn: 3600,
-      userId: user._id
+      accessToken,
+      refreshToken,
+      expiresIn: 900, // 15 minutes in seconds
+      userId: user._id,
+      username: user.username
     });
   } catch (err) {
     console.error('Login error:', err);
@@ -236,7 +285,48 @@ app.post('/auth/login', async (req, res) => {
   }
 });
 
-// Enhanced upload endpoint
+app.post('/auth/refresh', async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    
+    if (!refreshToken) {
+      return res.status(400).json({ error: 'Refresh token required' });
+    }
+
+    const payload = jwt.verify(refreshToken, process.env.REFRESH_TOKEN_SECRET);
+    const user = await User.findById(payload.userId);
+    
+    if (!user || user.tokenVersion !== payload.tokenVersion) {
+      return res.status(401).json({ error: 'Invalid refresh token' });
+    }
+
+    const newAccessToken = generateAccessToken(user);
+    const newRefreshToken = generateRefreshToken(user);
+
+    res.json({ 
+      accessToken: newAccessToken,
+      refreshToken: newRefreshToken,
+      expiresIn: 900
+    });
+  } catch (err) {
+    console.error('Refresh token error:', err);
+    res.status(401).json({ error: 'Invalid refresh token' });
+  }
+});
+
+app.post('/auth/logout', authenticateToken, async (req, res) => {
+  try {
+    await User.findByIdAndUpdate(req.user.userId, { 
+      $inc: { tokenVersion: 1 } 
+    });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Logout error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// File Routes
 app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -302,7 +392,6 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
   }
 });
 
-// Additional endpoints with improved error handling
 app.get('/files', authenticateToken, async (req, res) => {
   try {
     const files = await File.find({ userId: req.user.userId })
@@ -336,10 +425,14 @@ app.get('/files/:hash', authenticateToken, async (req, res) => {
 
 app.delete('/files/:hash', authenticateToken, async (req, res) => {
   try {
-    const file = await File.findOneAndDelete({ 
-      userId: req.user.userId,
-      ipfsHash: req.params.hash
-    });
+    const file = await File.findOneAndUpdate(
+      { 
+        userId: req.user.userId,
+        ipfsHash: req.params.hash
+      },
+      { pinStatus: 'unpinned' },
+      { new: true }
+    );
     
     if (!file) {
       return res.status(404).json({ error: 'File not found' });
@@ -353,18 +446,23 @@ app.delete('/files/:hash', authenticateToken, async (req, res) => {
   }
 });
 
-// Error handling middleware
+// ================
+// Error Handling
+// ================
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server with graceful shutdown
+// ================
+// Server Startup
+// ================
 const server = app.listen(port, () => {
   console.log(`🚀 Server running on port ${port}`);
   console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
+// Graceful Shutdown
 process.on('SIGTERM', () => {
   console.log('SIGTERM received. Shutting down gracefully...');
   server.close(() => {
