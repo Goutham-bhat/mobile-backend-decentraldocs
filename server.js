@@ -1,5 +1,4 @@
 require('dotenv').config();
-
 const express = require('express');
 const multer = require('multer');
 const cors = require('cors');
@@ -10,239 +9,368 @@ const mongoose = require('mongoose');
 const PinataClient = require('@pinata/sdk');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Load env variables
-const pinataApiKey = process.env.PINATA_API_KEY;
-const pinataSecretApiKey = process.env.PINATA_SECRET_API_KEY;
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
-const mongoUri = process.env.MONGODB_URI;
+// Enhanced environment validation
+const requiredEnvVars = [
+  'PINATA_API_KEY',
+  'PINATA_SECRET_API_KEY',
+  'JWT_SECRET',
+  'MONGODB_URI'
+];
 
-if (!pinataApiKey || !pinataSecretApiKey) {
-    console.error("❌ Pinata API keys missing! Please set PINATA_API_KEY and PINATA_SECRET_API_KEY in your .env file.");
-    process.exit(1);
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error(`❌ Missing required environment variables: ${missingVars.join(', ')}`);
+  process.exit(1);
 }
 
-if (!mongoUri) {
-    console.error("❌ MongoDB URI missing! Please set MONGODB_URI in your .env file.");
-    process.exit(1);
-}
-
-// Connect to MongoDB Atlas
-mongoose.connect(mongoUri, {
-    useNewUrlParser: true,
-    useUnifiedTopology: true,
-}).then(() => console.log('✅ Connected to MongoDB Atlas'))
-  .catch(err => {
-    console.error('❌ MongoDB connection error:', err);
-    process.exit(1);
+// Database connection with improved settings
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverSelectionTimeoutMS: 5000,
+  socketTimeoutMS: 45000
+})
+.then(() => console.log('✅ Connected to MongoDB Atlas'))
+.catch(err => {
+  console.error('❌ MongoDB connection error:', err);
+  process.exit(1);
 });
 
-// Define User schema/model
+// Enhanced rate limiting
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Models with validation and indexes
 const userSchema = new mongoose.Schema({
-    username: { type: String, unique: true },
-    password: String,
-});
-const User = mongoose.model('User', userSchema);
+  username: { 
+    type: String, 
+    unique: true,
+    required: true,
+    minlength: 3,
+    maxlength: 30
+  },
+  password: {
+    type: String,
+    required: true,
+    minlength: 8
+  },
+}, { timestamps: true });
 
-// Define File schema/model
 const fileSchema = new mongoose.Schema({
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
-    ipfsHash: String,
-    filename: String,
-    uploadedAt: { type: Date, default: Date.now },
-});
+  userId: { 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User',
+    required: true
+  },
+  ipfsHash: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  filename: {
+    type: String,
+    required: true
+  },
+  size: {
+    type: Number,
+    required: true
+  },
+  mimetype: String
+}, { timestamps: true });
+
+// Add indexes for better query performance
+fileSchema.index({ userId: 1 });
+fileSchema.index({ ipfsHash: 1 });
+
+const User = mongoose.model('User', userSchema);
 const File = mongoose.model('File', fileSchema);
 
-// Initialize Pinata client
+// Initialize Pinata with timeout
 const pinata = new PinataClient({
-    pinataApiKey,
-    pinataSecretApiKey
+  pinataApiKey: process.env.PINATA_API_KEY,
+  pinataSecretApiKey: process.env.PINATA_SECRET_API_KEY,
+  timeout: 30000 // 30 seconds timeout
 });
 
-pinata.testAuthentication()
-    .then(() => console.log('✅ Pinata authentication successful'))
-    .catch(err => {
-        console.error('❌ Pinata authentication failed:', err);
-        process.exit(1);
-    });
+// Enhanced authentication test
+async function verifyPinataConnection() {
+  try {
+    await pinata.testAuthentication();
+    console.log('✅ Pinata authentication successful');
+  } catch (err) {
+    console.error('❌ Pinata authentication failed:', err.message);
+    process.exit(1);
+  }
+}
+verifyPinataConnection();
 
-// Middleware
-app.use(cors()); // backend-only; no origin restrictions needed
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// Middleware stack
+app.use(cors({
+  origin: process.env.CORS_ORIGINS?.split(',') || '*',
+  methods: ['GET', 'POST', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
-const upload = multer({ dest: '/tmp/' });
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(apiLimiter);
 
-// JWT Auth Middleware
+// Configure multer with file size limits
+const upload = multer({
+  dest: '/tmp/',
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB limit
+    files: 1
+  },
+  fileFilter: (req, file, cb) => {
+    if (!file.originalname.match(/\.(jpg|jpeg|png|gif|pdf|docx|txt)$/i)) {
+      return cb(new Error('Only certain file types are allowed!'), false);
+    }
+    cb(null, true);
+  }
+});
+
+// Enhanced JWT middleware
 function authenticateToken(req, res, next) {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader?.split(' ')[1];
+  const authHeader = req.headers['authorization'];
+  const token = authHeader?.split(' ')[1];
 
-    if (!token) return res.status(401).json({ error: 'Missing token' });
+  if (!token) return res.status(401).json({ error: 'Authorization token required' });
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Invalid token' });
-        req.user = user;
-        next();
-    });
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) {
+      const message = err.name === 'TokenExpiredError' ? 
+        'Token expired' : 'Invalid token';
+      return res.status(403).json({ error: message });
+    }
+    
+    req.user = {
+      userId: decoded.userId,
+      username: decoded.username
+    };
+    next();
+  });
 }
 
-// Routes
+// Health check endpoint
 app.get('/', (req, res) => {
-    res.send('✅ Decentral Docs Backend is running (Pinata IPFS only)');
+  res.json({ 
+    status: 'healthy',
+    services: {
+      database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+      pinata: 'active'
+    },
+    timestamp: new Date()
+  });
 });
 
-// Register
+// Enhanced auth routes
 app.post('/auth/register', async (req, res) => {
+  try {
     const { username, password } = req.body;
+    
     if (!username || !password) {
-        return res.status(400).json({ error: 'Username and password required' });
+      return res.status(400).json({ error: 'Username and password required' });
     }
 
-    try {
-        if (await User.findOne({ username })) {
-            return res.status(409).json({ error: 'User already exists' });
-        }
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const newUser = new User({ username, password: hashedPassword });
-        await newUser.save();
-        res.status(201).json({ message: 'User registered successfully' });
-    } catch (err) {
-        console.error('Register error:', err);
-        res.status(500).json({ error: 'Server error' });
+    const existingUser = await User.findOne({ username });
+    if (existingUser) {
+      return res.status(409).json({ error: 'Username already exists' });
     }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+    const newUser = new User({ username, password: hashedPassword });
+    await newUser.save();
+
+    res.status(201).json({ 
+      message: 'User registered successfully',
+      userId: newUser._id
+    });
+  } catch (err) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Login
 app.post('/auth/login', async (req, res) => {
+  try {
     const { username, password } = req.body;
+    
     if (!username || !password) {
-        return res.status(400).json({ error: 'Username and password required' });
+      return res.status(400).json({ error: 'Username and password required' });
     }
 
-    try {
-        const user = await User.findOne({ username });
-        if (!user || !(await bcrypt.compare(password, user.password))) {
-            return res.status(401).json({ error: 'Invalid credentials' });
-        }
-        const token = jwt.sign({ userId: user._id, username }, JWT_SECRET, { expiresIn: '1h' });
-        res.json({ token });
-    } catch (err) {
-        console.error('Login error:', err);
-        res.status(500).json({ error: 'Server error' });
+    const user = await User.findOne({ username });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
     }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    const token = jwt.sign(
+      { userId: user._id, username: user.username },
+      process.env.JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+
+    res.json({ 
+      token,
+      expiresIn: 3600,
+      userId: user._id
+    });
+  } catch (err) {
+    console.error('Login error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
-// Upload
+// Enhanced upload endpoint
 app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
+  try {
     if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded.' });
+      return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const filePath = req.file.path;
-    const readableStreamForFile = fs.createReadStream(filePath);
-    const options = {
-        pinataMetadata: {
-            name: req.file.originalname,
-        },
+    const { path, originalname, mimetype, size } = req.file;
+    const readableStream = fs.createReadStream(path);
+
+    const pinataOptions = {
+      pinataMetadata: {
+        name: originalname,
+        keyvalues: {
+          userId: req.user.userId,
+          mimetype,
+          size
+        }
+      },
+      pinataOptions: {
+        cidVersion: 0
+      }
     };
 
-    try {
-        const result = await pinata.pinFileToIPFS(readableStreamForFile, options);
-        const newFile = new File({
-            userId: req.user.userId,
-            ipfsHash: result.IpfsHash,
-            filename: req.file.originalname,
-        });
-        await newFile.save();
+    const pinataResponse = await pinata.pinFileToIPFS(readableStream, pinataOptions);
+    
+    const fileRecord = new File({
+      userId: req.user.userId,
+      ipfsHash: pinataResponse.IpfsHash,
+      filename: originalname,
+      size,
+      mimetype
+    });
+    
+    await fileRecord.save();
+    await fsp.unlink(path);
 
-        await fsp.unlink(filePath);
-
-        res.status(200).json({
-            message: 'File uploaded to Pinata successfully!',
-            IpfsHash: result.IpfsHash,
-            PinSize: result.PinSize,
-            Timestamp: result.Timestamp,
-            isDuplicate: result.isDuplicate || false,
-        });
-    } catch (error) {
-        console.error("Pinata upload error:", error);
-        if (req.file?.path) {
-            try {
-                await fsp.unlink(filePath);
-            } catch (cleanupErr) {
-                console.error("Cleanup error:", cleanupErr);
-            }
-        }
-        res.status(500).json({ error: 'Failed to upload file to Pinata.' });
+    res.status(201).json({
+      success: true,
+      ipfsHash: pinataResponse.IpfsHash,
+      pinSize: pinataResponse.PinSize,
+      timestamp: pinataResponse.Timestamp,
+      fileInfo: {
+        name: originalname,
+        size,
+        type: mimetype
+      }
+    });
+  } catch (err) {
+    console.error('Upload error:', err);
+    
+    if (req.file?.path) {
+      try {
+        await fsp.unlink(req.file.path);
+      } catch (cleanupErr) {
+        console.error('File cleanup error:', cleanupErr);
+      }
     }
+
+    const statusCode = err.message.includes('File too large') ? 413 : 500;
+    res.status(statusCode).json({ 
+      error: err.message || 'File upload failed' 
+    });
+  }
 });
 
-// List files
+// Additional endpoints with improved error handling
 app.get('/files', authenticateToken, async (req, res) => {
-    try {
-        const userFiles = await File.find({ userId: req.user.userId }).select('-__v');
-        res.json({ files: userFiles });
-    } catch (err) {
-        console.error('Fetch files error:', err);
-        res.status(500).json({ error: 'Failed to retrieve files' });
-    }
+  try {
+    const files = await File.find({ userId: req.user.userId })
+      .sort({ createdAt: -1 })
+      .select('filename ipfsHash size mimetype createdAt');
+    
+    res.json({ files });
+  } catch (err) {
+    console.error('File list error:', err);
+    res.status(500).json({ error: 'Failed to retrieve files' });
+  }
 });
 
-// Unpin
-app.delete('/unpin/:hash', authenticateToken, async (req, res) => {
-    const ipfsHash = req.params.hash;
-
-    try {
-        const file = await File.findOneAndDelete({ userId: req.user.userId, ipfsHash });
-        if (!file) return res.status(404).json({ error: 'File not found' });
-
-        await pinata.unpin(ipfsHash);
-        res.json({ success: true, message: `File with hash ${ipfsHash} unpinned and deleted.` });
-    } catch (err) {
-        console.error('Unpin error:', err);
-        res.status(500).json({ error: 'Failed to unpin file' });
+app.get('/files/:hash', authenticateToken, async (req, res) => {
+  try {
+    const file = await File.findOne({ 
+      userId: req.user.userId,
+      ipfsHash: req.params.hash
+    });
+    
+    if (!file) {
+      return res.status(404).json({ error: 'File not found' });
     }
+    
+    res.json({ file });
+  } catch (err) {
+    console.error('File details error:', err);
+    res.status(500).json({ error: 'Failed to retrieve file details' });
+  }
 });
 
-// Download
-app.get('/download/:hash', authenticateToken, async (req, res) => {
-    const hash = req.params.hash;
-    const fileUrl = `https://gateway.pinata.cloud/ipfs/${hash}`;
-
-    try {
-        const file = await File.findOne({ userId: req.user.userId, ipfsHash: hash });
-        const originalName = file?.filename || hash;
-
-        https.get(fileUrl, fileRes => {
-            if (fileRes.statusCode !== 200) {
-                return res.status(fileRes.statusCode).json({ error: `Failed to retrieve file (Status: ${fileRes.statusCode})` });
-            }
-            res.setHeader('Content-Disposition', `attachment; filename="${originalName}"`);
-            fileRes.pipe(res);
-        }).on('error', err => {
-            console.error('Download error:', err);
-            res.status(500).json({ error: 'Failed to download file.' });
-        });
-    } catch (err) {
-        console.error('Preparation error:', err);
-        res.status(500).json({ error: 'Failed to prepare download.' });
+app.delete('/files/:hash', authenticateToken, async (req, res) => {
+  try {
+    const file = await File.findOneAndDelete({ 
+      userId: req.user.userId,
+      ipfsHash: req.params.hash
+    });
+    
+    if (!file) {
+      return res.status(404).json({ error: 'File not found' });
     }
+    
+    await pinata.unpin(file.ipfsHash);
+    res.json({ success: true, message: 'File unpinned successfully' });
+  } catch (err) {
+    console.error('Unpin error:', err);
+    res.status(500).json({ error: 'Failed to unpin file' });
+  }
 });
 
-// Start server
-app.listen(port, () => {
-    console.log(`🚀 Server live on port ${port}`);
-    console.log(`Pinata status: ${pinataApiKey ? '✅ Ready' : '❌ Not configured'}`);
-    console.log(`Available endpoints:
-    - GET    /                (Health check)
-    - POST   /auth/register   (Register)
-    - POST   /auth/login      (Login)
-    - POST   /upload          (Upload file)
-    - GET    /files           (List files)
-    - GET    /download/:hash  (Download file)
-    - DELETE /unpin/:hash     (Unpin file)`);
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server with graceful shutdown
+const server = app.listen(port, () => {
+  console.log(`🚀 Server running on port ${port}`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+});
+
+process.on('SIGTERM', () => {
+  console.log('SIGTERM received. Shutting down gracefully...');
+  server.close(() => {
+    mongoose.connection.close(false, () => {
+      console.log('MongoDB connection closed');
+      process.exit(0);
+    });
+  });
 });
