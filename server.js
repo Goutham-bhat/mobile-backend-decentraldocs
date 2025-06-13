@@ -14,6 +14,9 @@ const helmet = require('helmet');
 const app = express();
 const port = process.env.PORT || 3000;
 
+// Trust proxy to fix rate-limit IP detection issues in cloud envs
+app.set('trust proxy', 1);
+
 // ======================
 // Environment Validation
 // ======================
@@ -148,9 +151,9 @@ const upload = multer({
     files: 1
   },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = /\.(jpg|jpeg|png|gif|pdf|docx|txt)$/i;
+    const allowedTypes = /\.(jpg|jpeg|png|gif|pdf|docx|txt|enc)$/i;
     if (!file.originalname.match(allowedTypes)) {
-      return cb(new Error('Only image, PDF, and text files are allowed'), false);
+      return cb(new Error('Only supported file types allowed (jpg, pdf, txt, enc, etc)'), false);
     }
     cb(null, true);
   }
@@ -163,7 +166,7 @@ const generateToken = (user) => {
   return jwt.sign(
     { userId: user._id, username: user.username },
     process.env.JWT_SECRET,
-    { expiresIn: '15m' } // Token expires in 15 minutes
+    { expiresIn: '15m' }
   );
 };
 
@@ -255,7 +258,7 @@ app.post('/auth/login', async (req, res) => {
 
     res.json({ 
       token,
-      expiresIn: 900, // 15 minutes in seconds
+      expiresIn: 900,
       userId: user._id,
       username: user.username
     });
@@ -266,11 +269,10 @@ app.post('/auth/login', async (req, res) => {
 });
 
 app.post('/auth/logout', authenticateToken, (req, res) => {
-  // Simple token expiration - no server-side cleanup needed
   res.json({ success: true });
 });
 
-// File Routes
+// File Upload Route
 app.post('/upload', authenticateToken, upload.single('file'), async (req, res) => {
   try {
     if (!req.file) {
@@ -295,7 +297,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
     };
 
     const pinataResponse = await pinata.pinFileToIPFS(readableStream, pinataOptions);
-    
+
     const fileRecord = new File({
       userId: req.user.userId,
       ipfsHash: pinataResponse.IpfsHash,
@@ -303,7 +305,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
       size,
       mimetype
     });
-    
+
     await fileRecord.save();
     await fsp.unlink(path);
 
@@ -320,7 +322,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
     });
   } catch (err) {
     console.error('Upload error:', err);
-    
+
     if (req.file?.path) {
       try {
         await fsp.unlink(req.file.path);
@@ -335,8 +337,6 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
     });
   }
 });
-
-// ... (rest of your file routes remain the same)
 
 // ================
 // Error Handling
@@ -355,12 +355,11 @@ const server = app.listen(port, () => {
 });
 
 // Graceful Shutdown
-process.on('SIGTERM', () => {
+process.on('SIGTERM', async () => {
   console.log('SIGTERM received. Shutting down gracefully...');
-  server.close(() => {
-    mongoose.connection.close(false, () => {
-      console.log('MongoDB connection closed');
-      process.exit(0);
-    });
+  server.close(async () => {
+    await mongoose.connection.close();
+    console.log('MongoDB connection closed');
+    process.exit(0);
   });
 });
