@@ -338,7 +338,8 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
 // ✅ Fixed: Get user's files securely
 app.get('/my-files', authenticateToken, async (req, res) => {
   try {
-    const userFiles = await File.find({ userId: req.user.userId }).sort({ createdAt: -1 });
+    const userObjectId = new mongoose.Types.ObjectId(req.user.userId);
+    const userFiles = await File.find({ userId: userObjectId }).sort({ createdAt: -1 });
     res.json({ files: userFiles });
   } catch (err) {
     console.error('Fetch user files error:', err);
