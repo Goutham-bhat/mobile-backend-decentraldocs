@@ -74,7 +74,15 @@ const userSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const fileSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  userId: { 
+    type: mongoose.Schema.Types.ObjectId, 
+    ref: 'User', 
+    required: true,
+    validate: {
+      validator: v => mongoose.Types.ObjectId.isValid(v),
+      message: props => `${props.value} is not a valid user ID!`
+    }
+  },
   ipfsHash: { type: String, required: true, unique: true },
   filename: { type: String, required: true },
   size: { type: Number, required: true },
@@ -123,7 +131,10 @@ const upload = multer({
 // JWT Helpers
 // ===============
 const generateToken = (user) => jwt.sign(
-  { userId: user._id, username: user.username },
+  { 
+    userId: user._id.toString(), // Explicit string conversion
+    username: user.username 
+  },
   process.env.JWT_SECRET,
   { expiresIn: '15m' }
 );
@@ -137,6 +148,13 @@ const authenticateToken = (req, res, next) => {
       console.error('JWT verification failed:', err);
       return res.status(403).json({ error: 'Token invalid or expired', code: 'TOKEN_EXPIRED' });
     }
+    
+    // Convert string ID to ObjectId immediately
+    if (!mongoose.Types.ObjectId.isValid(decoded.userId)) {
+      return res.status(403).json({ error: 'Invalid user ID in token' });
+    }
+    decoded.userId = new mongoose.Types.ObjectId(decoded.userId);
+    
     console.log('Authenticated user:', { userId: decoded.userId, username: decoded.username });
     req.user = decoded;
     next();
@@ -203,7 +221,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
       pinataMetadata: {
         name: originalname,
         keyvalues: { 
-          userId: req.user.userId, 
+          userId: req.user.userId.toString(), // Ensure string format
           mimetype, 
           size,
           uploadedBy: req.user.username
@@ -214,7 +232,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
 
     const result = await pinata.pinFileToIPFS(stream, pinataOptions);
     const record = new File({
-      userId: req.user.userId,
+      userId: req.user.userId, // Already ObjectId from middleware
       ipfsHash: result.IpfsHash,
       filename: originalname,
       size,
@@ -243,40 +261,27 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
 // Fixed my-files endpoint with proper user filtering
 app.get('/my-files', authenticateToken, async (req, res) => {
   try {
-    // Validate user ID
-    if (!req.user?.userId || !mongoose.Types.ObjectId.isValid(req.user.userId)) {
-      return res.status(400).json({ error: 'Invalid user identifier' });
-    }
-
-    const userId = new mongoose.Types.ObjectId(req.user.userId);
-    console.log(`Fetching files for user: ${userId}`);
-
-    const files = await File.find({ userId: { $eq: userId } })
+    // User ID already validated and converted to ObjectId in authenticateToken
+    const userId = req.user.userId;
+    
+    // Use Mongoose's strict query
+    const files = await File.find({ userId })
       .sort({ createdAt: -1 })
       .lean();
 
-    // Security verification
-    const foreignFiles = files.filter(f => !f.userId.equals(userId));
-    if (foreignFiles.length > 0) {
-      console.error('Security Alert: Found files from other users!', {
+    // Final verification
+    const invalidFiles = files.filter(f => !f.userId.equals(userId));
+    if (invalidFiles.length > 0) {
+      console.error('SECURITY VIOLATION: Foreign files detected', {
         expectedUser: userId,
-        foreignFiles: foreignFiles.map(f => f._id)
+        receivedFiles: invalidFiles.map(f => f._id)
       });
-      return res.status(500).json({ error: 'Data integrity issue' });
+      return res.status(500).json({ error: 'Data integrity error' });
     }
 
-    console.log(`Found ${files.length} files for user ${userId}`);
     res.json({ files });
   } catch (err) {
-    console.error('File fetch error:', {
-      error: err.message,
-      userId: req.user?.userId,
-      stack: err.stack
-    });
-
-    if (err instanceof mongoose.Error.CastError) {
-      return res.status(400).json({ error: 'Invalid data format' });
-    }
+    console.error('File fetch error:', err);
     res.status(500).json({ error: 'Failed to retrieve files' });
   }
 });
