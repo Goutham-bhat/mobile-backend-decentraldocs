@@ -335,7 +335,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
   }
 });
 
-// ✅ New Route: Get user's files
+// ✅ Fixed: Get user's files securely
 app.get('/my-files', authenticateToken, async (req, res) => {
   try {
     const userFiles = await File.find({ userId: req.user.userId }).sort({ createdAt: -1 });
