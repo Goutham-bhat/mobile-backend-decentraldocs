@@ -91,9 +91,8 @@ const fileSchema = new mongoose.Schema({
   uploadedAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
-// Create indexes
 userSchema.index({ username: 1 });
-fileSchema.index({ userId: 1 });  // Critical for user-specific queries
+fileSchema.index({ userId: 1 });
 fileSchema.index({ ipfsHash: 1 });
 
 const User = mongoose.model('User', userSchema);
@@ -132,7 +131,7 @@ const upload = multer({
 // ===============
 const generateToken = (user) => jwt.sign(
   { 
-    userId: user._id.toString(), // Explicit string conversion
+    userId: user._id.toString(),
     username: user.username 
   },
   process.env.JWT_SECRET,
@@ -149,7 +148,6 @@ const authenticateToken = (req, res, next) => {
       return res.status(403).json({ error: 'Token invalid or expired', code: 'TOKEN_EXPIRED' });
     }
     
-    // Convert string ID to ObjectId immediately
     if (!mongoose.Types.ObjectId.isValid(decoded.userId)) {
       return res.status(403).json({ error: 'Invalid user ID in token' });
     }
@@ -221,7 +219,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
       pinataMetadata: {
         name: originalname,
         keyvalues: { 
-          userId: req.user.userId.toString(), // Ensure string format
+          userId: req.user.userId.toString(),
           mimetype, 
           size,
           uploadedBy: req.user.username
@@ -232,7 +230,7 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
 
     const result = await pinata.pinFileToIPFS(stream, pinataOptions);
     const record = new File({
-      userId: req.user.userId, // Already ObjectId from middleware
+      userId: req.user.userId,
       ipfsHash: result.IpfsHash,
       filename: originalname,
       size,
@@ -258,30 +256,33 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
   }
 });
 
-// Fixed my-files endpoint with proper user filtering
+// --- Enhanced Logging in my-files ---
 app.get('/my-files', authenticateToken, async (req, res) => {
+  console.log(`📥 GET /my-files called by user ${req.user.username} (${req.user.userId})`);
   try {
-    // User ID already validated and converted to ObjectId in authenticateToken
     const userId = req.user.userId;
-    
-    // Use Mongoose's strict query
-    const files = await File.find({ userId })
-      .sort({ createdAt: -1 })
-      .lean();
+    console.log('➡️ Fetching files for userId:', userId.toString());
 
-    // Final verification
+    const files = await File.find({ userId }).sort({ createdAt: -1 }).lean();
+    console.log(`🔍 Found ${files.length} files for user ${userId}:`);
+files.forEach(file => {
+  console.log(`   🗂️ File ID: ${file._id}, Name: ${file.filename}, Hash: ${file.ipfsHash}`);
+});
+
+
     const invalidFiles = files.filter(f => !f.userId.equals(userId));
     if (invalidFiles.length > 0) {
-      console.error('SECURITY VIOLATION: Foreign files detected', {
+      console.error('⚠️ SECURITY VIOLATION: Foreign files detected!', {
         expectedUser: userId,
         receivedFiles: invalidFiles.map(f => f._id)
       });
       return res.status(500).json({ error: 'Data integrity error' });
     }
 
+    console.log('✅ Files validated, sending response');
     res.json({ files });
   } catch (err) {
-    console.error('File fetch error:', err);
+    console.error('❌ File fetch error:', err);
     res.status(500).json({ error: 'Failed to retrieve files' });
   }
 });
