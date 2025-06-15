@@ -193,6 +193,7 @@ app.post('/auth/register', async (req, res) => {
 
 app.post('/auth/login', async (req, res) => {
   try {
+    console.log('BODY:', req.body); // 👈 add this line
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
@@ -286,6 +287,33 @@ files.forEach(file => {
     res.status(500).json({ error: 'Failed to retrieve files' });
   }
 });
+
+// --- Delete File ---
+app.delete('/delete-file/:cid', authenticateToken, async (req, res) => {
+  const { cid } = req.params;
+  const userId = req.user.userId;
+
+  if (!cid) return res.status(400).json({ error: 'CID is required' });
+
+  try {
+    const file = await File.findOneAndDelete({ ipfsHash: cid, userId });
+    if (!file) return res.status(404).json({ error: 'File not found or not owned by user' });
+
+    // Optionally unpin from Pinata
+    try {
+      await pinata.unpin(cid);
+      console.log(`📤 Unpinned ${cid} from Pinata`);
+    } catch (pinErr) {
+      console.warn(`⚠️ Failed to unpin ${cid} from Pinata:`, pinErr.message);
+    }
+
+    res.status(200).json({ message: 'File deleted successfully' });
+  } catch (err) {
+    console.error('❌ Delete error:', err);
+    res.status(500).json({ error: 'Failed to delete file on server' });
+  }
+});
+
 
 // --- Global Error ---
 app.use((err, req, res, next) => {
