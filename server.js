@@ -14,7 +14,6 @@ const helmet = require('helmet');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Trust proxy to fix rate-limit IP detection issues in cloud envs
 app.set('trust proxy', 1);
 
 // ======================
@@ -66,7 +65,6 @@ const pinata = new PinataClient({
   timeout: 30000
 });
 
-// Verify Pinata connection
 pinata.testAuthentication()
   .then(() => console.log('✅ Pinata authentication successful'))
   .catch(err => {
@@ -120,7 +118,6 @@ const fileSchema = new mongoose.Schema({
   }
 }, { timestamps: true });
 
-// Add indexes
 userSchema.index({ username: 1 });
 fileSchema.index({ userId: 1 });
 fileSchema.index({ ipfsHash: 1 });
@@ -335,6 +332,17 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
     res.status(statusCode).json({ 
       error: err.message || 'File upload failed' 
     });
+  }
+});
+
+// ✅ New Route: Get user's files
+app.get('/my-files', authenticateToken, async (req, res) => {
+  try {
+    const userFiles = await File.find({ userId: req.user.userId }).sort({ createdAt: -1 });
+    res.json({ files: userFiles });
+  } catch (err) {
+    console.error('Fetch user files error:', err);
+    res.status(500).json({ error: 'Failed to fetch user files' });
   }
 });
 
