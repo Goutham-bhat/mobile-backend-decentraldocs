@@ -135,7 +135,7 @@ const generateToken = (user) => jwt.sign(
     username: user.username 
   },
   process.env.JWT_SECRET,
-  { expiresIn: '15m' }
+  { expiresIn: '30m' } // ✅ CHANGED from '15m' to '30m'
 );
 
 const authenticateToken = (req, res, next) => {
@@ -193,7 +193,7 @@ app.post('/auth/register', async (req, res) => {
 
 app.post('/auth/login', async (req, res) => {
   try {
-    console.log('BODY:', req.body); // 👈 add this line
+    console.log('BODY:', req.body);
     const { username, password } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
 
@@ -202,7 +202,7 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials' });
 
     const token = generateToken(user);
-    res.json({ token, userId: user._id, username: user.username, expiresIn: 900 });
+    res.json({ token, userId: user._id, username: user.username, expiresIn: 1800 });
   } catch (err) {
     console.error('Login error:', err);
     res.status(500).json({ error: 'Internal server error' });
@@ -257,7 +257,6 @@ app.post('/upload', authenticateToken, upload.single('file'), async (req, res) =
   }
 });
 
-// --- Enhanced Logging in my-files ---
 app.get('/my-files', authenticateToken, async (req, res) => {
   console.log(`📥 GET /my-files called by user ${req.user.username} (${req.user.userId})`);
   try {
@@ -266,10 +265,9 @@ app.get('/my-files', authenticateToken, async (req, res) => {
 
     const files = await File.find({ userId }).sort({ createdAt: -1 }).lean();
     console.log(`🔍 Found ${files.length} files for user ${userId}:`);
-files.forEach(file => {
-  console.log(`   🗂️ File ID: ${file._id}, Name: ${file.filename}, Hash: ${file.ipfsHash}`);
-});
-
+    files.forEach(file => {
+      console.log(`   🗂️ File ID: ${file._id}, Name: ${file.filename}, Hash: ${file.ipfsHash}`);
+    });
 
     const invalidFiles = files.filter(f => !f.userId.equals(userId));
     if (invalidFiles.length > 0) {
@@ -288,7 +286,6 @@ files.forEach(file => {
   }
 });
 
-// --- Delete File ---
 app.delete('/delete-file/:cid', authenticateToken, async (req, res) => {
   const { cid } = req.params;
   const userId = req.user.userId;
@@ -299,7 +296,6 @@ app.delete('/delete-file/:cid', authenticateToken, async (req, res) => {
     const file = await File.findOneAndDelete({ ipfsHash: cid, userId });
     if (!file) return res.status(404).json({ error: 'File not found or not owned by user' });
 
-    // Optionally unpin from Pinata
     try {
       await pinata.unpin(cid);
       console.log(`📤 Unpinned ${cid} from Pinata`);
@@ -313,7 +309,6 @@ app.delete('/delete-file/:cid', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Failed to delete file on server' });
   }
 });
-
 
 // --- Global Error ---
 app.use((err, req, res, next) => {
